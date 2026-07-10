@@ -1,0 +1,334 @@
+name: Code Quality & Security
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+
+concurrency:
+  group: code-quality-security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sonar:
+    name: SonarQube Quality Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Ensure SonarQube project exists
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import pathlib
+          import urllib.parse
+          import urllib.request
+          import os
+
+          sonar_host = os.environ["SONAR_HOST_URL"].rstrip("/")
+          sonar_token = os.environ["SONAR_TOKEN"]
+          repo = os.environ["GH_REPOSITORY"]
+
+          props = pathlib.Path("sonar-project.properties")
+          project_key = ""
+          project_name = repo.rsplit("/", 1)[-1]
+          if props.exists():
+              for line in props.read_text().splitlines():
+                  line = line.strip()
+                  if line.startswith("sonar.projectKey="):
+                      project_key = line.split("=", 1)[1].strip()
+                      break
+                  if line.startswith("sonar.projectName="):
+                      project_name = line.split("=", 1)[1].strip()
+          if not project_key:
+              project_key = repo.replace("/", "_")
+              props.write_text(
+                  f"sonar.projectKey={project_key}\n"
+                  f"sonar.projectName={project_name}\n"
+                  "sonar.sources=.\n"
+                  "sonar.exclusions=**/.git/**,**/.venv/**,**/venv/**,**/node_modules/**,**/dist/**,**/build/**,**/__pycache__/**\n"
+              )
+
+          auth = base64.b64encode((sonar_token + ":").encode()).decode()
+
+          def request(path, data=None):
+              encoded = urllib.parse.urlencode(data or {}).encode()
+              req = urllib.request.Request(f"{sonar_host}{path}", data=encoded, method="POST")
+              req.add_header("Authorization", f"Basic {auth}")
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      return response.status, response.read().decode()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, exc.read().decode()
+
+          status, body = request(
+              "/api/projects/create",
+              {"project": project_key, "name": project_name},
+          )
+          if status in (200, 204, 400) and ("already exists" in body.lower() or status != 400):
+              print(f"SonarQube project ready: {project_key}")
+          else:
+              raise SystemExit(f"Unable to create SonarQube project {project_key}: HTTP {status} {body}")
+          PY
+
+      - name: SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+  secrets-scan:
+    name: Gitleaks Secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  sast:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Semgrep
+        run: semgrep ci --config p/security-audit --config p/secrets
+
+  deps-scan:
+    name: Trivy Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          format: table
+          output: trivy-results.txt
+
+      - name: Upload Trivy results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.txt
+          retention-days: 7
+
+  report:
+    name: Report
+    runs-on: ubuntu-latest
+    needs: [sonar, secrets-scan, sast, deps-scan]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build report
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_RESULT: ${{ needs.sonar.result }}
+          GITLEAKS_RESULT: ${{ needs.secrets-scan.result }}
+          SEMGREP_RESULT: ${{ needs.sast.result }}
+          TRIVY_RESULT: ${{ needs.deps-scan.result }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+          import urllib.request
+
+          checks = {
+              "SonarQube Quality Gate": os.environ.get("SONAR_RESULT", "unknown"),
+              "Gitleaks secrets": os.environ.get("GITLEAKS_RESULT", "unknown"),
+              "Semgrep SAST": os.environ.get("SEMGREP_RESULT", "unknown"),
+              "Trivy dependencies/CVEs": os.environ.get("TRIVY_RESULT", "unknown"),
+          }
+
+          repo = os.environ.get("GH_REPOSITORY", "")
+          ref = os.environ.get("GH_REF_NAME", "")
+          sha = os.environ.get("GH_SHA", "")[:7]
+          pr_num = os.environ.get("PR_NUMBER", "").strip()
+          run_url = (
+              f"{os.environ.get('GH_SERVER_URL', 'https://github.com')}"
+              f"/{repo}/actions/runs/{os.environ.get('GH_RUN_ID', '')}"
+          )
+          sonar_host = os.environ.get("SONAR_HOST_URL", "").rstrip("/")
+          sonar_token = os.environ.get("SONAR_TOKEN", "")
+
+          project_key = ""
+          props = pathlib.Path("sonar-project.properties")
+          if props.exists():
+              for line in props.read_text().splitlines():
+                  line = line.strip()
+                  if line.startswith("sonar.projectKey="):
+                      project_key = line.split("=", 1)[1].strip()
+                      break
+
+          def sonar_get(path, params):
+              if not sonar_host or not sonar_token:
+                  return None
+              query = urllib.parse.urlencode(params)
+              req = urllib.request.Request(f"{sonar_host}{path}?{query}")
+              token = base64.b64encode((sonar_token + ":").encode()).decode()
+              req.add_header("Authorization", f"Basic {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      return json.loads(resp.read().decode())
+              except Exception as exc:
+                  return {"error": str(exc)}
+
+          quality_gate = None
+          issues = []
+          if project_key:
+              quality_gate = sonar_get(
+                  "/api/qualitygates/project_status",
+                  {"projectKey": project_key},
+              )
+              issue_data = sonar_get(
+                  "/api/issues/search",
+                  {
+                      "componentKeys": project_key,
+                      "resolved": "false",
+                      "types": "VULNERABILITY,SECURITY_HOTSPOT",
+                      "severities": "BLOCKER,CRITICAL,HIGH,MAJOR",
+                      "ps": "10",
+                  },
+              )
+              if isinstance(issue_data, dict):
+                  issues = issue_data.get("issues", [])[:10]
+
+          qg_status = "unknown"
+          if isinstance(quality_gate, dict):
+              qg_status = quality_gate.get("projectStatus", {}).get("status", "unknown")
+
+          icons = {"success": "PASS", "failure": "FAIL", "cancelled": "CANCELLED", "skipped": "SKIPPED"}
+          rows = [f"| {name} | {icons.get(result, result.upper())} |" for name, result in checks.items()]
+
+          sonar_url = f"{sonar_host}/dashboard?id={urllib.parse.quote(project_key)}" if sonar_host and project_key else sonar_host
+          issue_lines = []
+          for issue in issues:
+              component = issue.get("component", "")
+              path = component.split(":", 1)[1] if ":" in component else component
+              line = issue.get("line", "")
+              sev = issue.get("severity", issue.get("impactSeverity", ""))
+              msg = issue.get("message", "").replace("\n", " ")
+              issue_lines.append(f"- {sev} {path}:{line} - {msg}")
+
+          markdown = [
+              "## Code Quality & Security Scan",
+              "",
+              "| Check | Result |",
+              "|---|---|",
+              *rows,
+              "",
+              f"SonarQube project: `{project_key or 'not configured'}`",
+              f"SonarQube quality gate: `{qg_status}`",
+              f"SonarQube dashboard: {sonar_url or 'not configured'}",
+              "",
+              "### Top Open SonarQube Security Issues",
+              *(issue_lines or ["No open SonarQube vulnerabilities/security hotspots returned by the API."]),
+              "",
+              f"[View GitHub Actions run]({run_url})",
+          ]
+
+          all_passed = all(v in ("success", "skipped") for v in checks.values())
+          chat_lines = [
+              "CODE QUALITY & SECURITY SCAN PASSED" if all_passed else "CODE QUALITY & SECURITY SCAN - ACTION REQUIRED",
+              f"Repository : {repo}",
+              f"Branch     : {ref} | Commit: {sha}",
+              f"PR         : #{pr_num}" if pr_num else "Trigger    : push",
+              "",
+              *(f"{icons.get(v, v.upper())} - {k}" for k, v in checks.items()),
+              "",
+              f"SonarQube quality gate: {qg_status}",
+              f"SonarQube dashboard: {sonar_url or 'not configured'}",
+          ]
+          if issue_lines:
+              chat_lines.extend(["", "Top SonarQube security issues:", *issue_lines[:5]])
+          chat_lines.extend(["", f"Details: {run_url}"])
+
+          pathlib.Path("/tmp/scan-comment.md").write_text("\n".join(markdown))
+          pathlib.Path("/tmp/scan-chat.txt").write_text("\n".join(chat_lines))
+          PY
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/scan-comment.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+      - name: Notify Google Chat
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import urllib.request
+
+          webhook = os.environ.get("GOOGLE_CHAT_WEBHOOK", "").strip()
+          if not webhook:
+              print("GOOGLE_CHAT_WEBHOOK secret not set - skipping notification.")
+              sys.exit(0)
+
+          text = pathlib.Path("/tmp/scan-chat.txt").read_text()
+          req = urllib.request.Request(
+              webhook,
+              data=json.dumps({"text": text}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=20) as response:
+              print(f"Notification sent to Google Chat. HTTP {response.status}")
+          PY
