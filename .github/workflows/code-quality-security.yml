@@ -5,6 +5,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
+    branches:
+      - "**"
+  schedule:
+    # Re-scan even without code changes so newly disclosed CVEs and new rules are evaluated.
+    - cron: "17 3 * * 1"
 
 concurrency:
   group: code-quality-security-${{ github.ref }}
@@ -18,16 +23,32 @@ jobs:
     name: SonarQube Quality Gate
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.base.ref == github.event.repository.default_branch) ||
+      (github.event_name != 'pull_request' &&
+       github.ref_name == github.event.repository.default_branch)
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
-      - name: Ensure SonarQube project exists
+      - name: Validate SonarQube configuration
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        run: |
+          SONAR_TOKEN="$(printf '%s' "$SONAR_TOKEN" | tr -d '\r\n')"
+          SONAR_HOST_URL="$(printf '%s' "$SONAR_HOST_URL" | tr -d '\r\n')"
+          if [ -z "$SONAR_TOKEN" ] || [ -z "$SONAR_HOST_URL" ]; then
+            echo "SONAR_TOKEN and SONAR_HOST_URL must be configured as repository secrets." >&2
+            exit 1
+          fi
+          printf 'SONAR_TOKEN=%s\n' "$SONAR_TOKEN" >> "$GITHUB_ENV"
+          printf 'SONAR_HOST_URL=%s\n' "$SONAR_HOST_URL" >> "$GITHUB_ENV"
+
+      - name: Ensure SonarQube project exists
+        env:
           GH_REPOSITORY: ${{ github.repository }}
         run: |
           python3 - <<'PY'
@@ -49,8 +70,7 @@ jobs:
                   line = line.strip()
                   if line.startswith("sonar.projectKey="):
                       project_key = line.split("=", 1)[1].strip()
-                      break
-                  if line.startswith("sonar.projectName="):
+                  elif line.startswith("sonar.projectName="):
                       project_name = line.split("=", 1)[1].strip()
           if not project_key:
               project_key = repo.replace("/", "_")
@@ -79,15 +99,17 @@ jobs:
           )
           if status in (200, 204, 400) and ("already exists" in body.lower() or status != 400):
               print(f"SonarQube project ready: {project_key}")
+          elif status in (401, 403):
+              print(
+                  "Project provisioning is not permitted by this analysis token; "
+                  "continuing with the existing project."
+              )
           else:
               raise SystemExit(f"Unable to create SonarQube project {project_key}: HTTP {status} {body}")
           PY
 
       - name: SonarQube scan
-        uses: sonarsource/sonarqube-scan-action@v2
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        uses: sonarsource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         with:
           args: -Dsonar.qualitygate.wait=true
 
@@ -96,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
 
@@ -105,7 +127,7 @@ jobs:
           docker run --rm \
             -v "$PWD:/repo" \
             -w /repo \
-            zricethezav/gitleaks:v8.30.1 \
+            zricethezav/gitleaks:v8.30.1@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb \
             detect --source . --no-git --no-banner --redact --exit-code 1
 
   sast:
@@ -113,9 +135,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.169.0@sha256:a40de619d5f2ede141f64ce73a1e8a5b2b00ca32e607fb20c8f6671f3190e604
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Semgrep
         run: semgrep ci --config p/security-audit --config p/secrets
@@ -125,10 +147,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -139,7 +161,7 @@ jobs:
 
       - name: Upload Trivy results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: trivy-results
           path: trivy-results.txt
@@ -155,7 +177,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Build report
         env:
@@ -171,6 +193,8 @@ jobs:
           GH_SERVER_URL: ${{ github.server_url }}
           GH_RUN_ID: ${{ github.run_id }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           python3 - <<'PY'
           import base64
@@ -191,13 +215,19 @@ jobs:
           ref = os.environ.get("GH_REF_NAME", "")
           sha = os.environ.get("GH_SHA", "")[:7]
           pr_num = os.environ.get("PR_NUMBER", "").strip()
+          pr_base = os.environ.get("PR_BASE_REF", "").strip()
+          default_branch = os.environ.get("DEFAULT_BRANCH", "").strip()
+          sonar_result = os.environ.get("SONAR_RESULT", "unknown")
           run_url = (
               f"{os.environ.get('GH_SERVER_URL', 'https://github.com')}"
               f"/{repo}/actions/runs/{os.environ.get('GH_RUN_ID', '')}"
           )
-          sonar_host = os.environ.get("SONAR_HOST_URL", "").rstrip("/")
-          sonar_token = os.environ.get("SONAR_TOKEN", "")
+          sonar_host = os.environ.get("SONAR_HOST_URL", "").strip().rstrip("/")
+          sonar_token = os.environ.get("SONAR_TOKEN", "").strip()
           sonar_configured = bool(sonar_host and sonar_token)
+          sonar_pr_analysis = bool(
+              pr_num and pr_base == default_branch and sonar_result != "skipped"
+          )
 
           project_key = ""
           props = pathlib.Path("sonar-project.properties")
@@ -207,6 +237,8 @@ jobs:
                   if line.startswith("sonar.projectKey="):
                       project_key = line.split("=", 1)[1].strip()
                       break
+          if not project_key:
+              project_key = repo.replace("/", "_")
 
           def sonar_get(path, params):
               if not sonar_host or not sonar_token:
@@ -223,32 +255,55 @@ jobs:
 
           quality_gate = None
           issues = []
-          if project_key:
+          issue_lookup_error = False
+          if project_key and sonar_result != "skipped":
+              analysis_selector = {"projectKey": project_key}
+              if sonar_pr_analysis:
+                  analysis_selector["pullRequest"] = pr_num
               quality_gate = sonar_get(
                   "/api/qualitygates/project_status",
-                  {"projectKey": project_key},
+                  analysis_selector,
               )
+              issue_selector = {
+                  "componentKeys": project_key,
+                  "resolved": "false",
+                  "types": "VULNERABILITY,SECURITY_HOTSPOT",
+                  "severities": "BLOCKER,CRITICAL,HIGH,MAJOR",
+                  "ps": "10",
+              }
+              if sonar_pr_analysis:
+                  issue_selector["pullRequest"] = pr_num
               issue_data = sonar_get(
                   "/api/issues/search",
-                  {
-                      "componentKeys": project_key,
-                      "resolved": "false",
-                      "types": "VULNERABILITY,SECURITY_HOTSPOT",
-                      "severities": "BLOCKER,CRITICAL,HIGH,MAJOR",
-                      "ps": "10",
-                  },
+                  issue_selector,
               )
-              if isinstance(issue_data, dict):
+              if isinstance(issue_data, dict) and "error" not in issue_data:
                   issues = issue_data.get("issues", [])[:10]
+              elif isinstance(issue_data, dict):
+                  issue_lookup_error = True
 
-          qg_status = "unknown"
-          if isinstance(quality_gate, dict):
+          qg_status = "SKIPPED" if sonar_result == "skipped" else "unknown"
+          if isinstance(quality_gate, dict) and "error" not in quality_gate:
               qg_status = quality_gate.get("projectStatus", {}).get("status", "unknown")
+
+          if sonar_pr_analysis:
+              analysis_scope = f"pull request #{pr_num} -> {pr_base}"
+          elif sonar_result == "skipped" and pr_num:
+              analysis_scope = f"skipped: PR target {pr_base or 'unknown'} is not {default_branch}"
+          elif sonar_result == "skipped":
+              analysis_scope = "skipped: ref is not the default branch"
+          else:
+              analysis_scope = f"default branch {default_branch}"
 
           icons = {"success": "PASS", "failure": "FAIL", "cancelled": "CANCELLED", "skipped": "SKIPPED"}
           rows = [f"| {name} | {icons.get(result, result.upper())} |" for name, result in checks.items()]
 
-          sonar_url = f"{sonar_host}/dashboard?id={urllib.parse.quote(project_key)}" if sonar_host and project_key else sonar_host
+          sonar_url = sonar_host
+          if sonar_host and project_key:
+              dashboard_params = {"id": project_key}
+              if sonar_pr_analysis:
+                  dashboard_params["pullRequest"] = pr_num
+              sonar_url = f"{sonar_host}/dashboard?{urllib.parse.urlencode(dashboard_params)}"
           issue_lines = []
           for issue in issues:
               component = issue.get("component", "")
@@ -258,6 +313,13 @@ jobs:
               msg = issue.get("message", "").replace("\n", " ")
               issue_lines.append(f"- {sev} {path}:{line} - {msg}")
 
+          if issue_lookup_error and sonar_pr_analysis:
+              issue_summary = ["Open the SonarQube PR dashboard to review issue details."]
+          elif issue_lookup_error:
+              issue_summary = ["SonarQube issue details could not be retrieved by the report job."]
+          else:
+              issue_summary = issue_lines or ["No open SonarQube vulnerabilities/security hotspots returned by the API."]
+
           markdown = [
               "## Code Quality & Security Scan",
               "",
@@ -266,12 +328,13 @@ jobs:
               *rows,
               "",
               f"SonarQube project: `{project_key or 'not configured'}`",
+              f"SonarQube analysis: `{analysis_scope}`",
               f"SonarQube quality gate: `{qg_status}`",
               f"SonarQube dashboard: {sonar_url or 'not configured'}",
               f"SonarQube secrets configured: `{'yes' if sonar_configured else 'no'}`",
               "",
               "### Top Open SonarQube Security Issues",
-              *(issue_lines or ["No open SonarQube vulnerabilities/security hotspots returned by the API."]),
+              *issue_summary,
               "",
               f"[View GitHub Actions run]({run_url})",
           ]
@@ -285,6 +348,7 @@ jobs:
               "",
               *(f"{icons.get(v, v.upper())} - {k}" for k, v in checks.items()),
               "",
+              f"SonarQube analysis: {analysis_scope}",
               f"SonarQube quality gate: {qg_status}",
               f"SonarQube dashboard: {sonar_url or 'not configured'}",
               f"SonarQube secrets configured: {'yes' if sonar_configured else 'no'}",
@@ -299,7 +363,7 @@ jobs:
 
       - name: Post PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           github-token: ${{ github.token }}
           script: |
