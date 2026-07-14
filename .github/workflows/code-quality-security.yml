@@ -1,19 +1,20 @@
-name: Code Quality & Security
+name: Security Analysis
 
 on:
-  workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened]
-  push:
-    branches:
-      - "**"
-  schedule:
-    # Re-scan even without code changes so newly disclosed CVEs and new rules are evaluated.
-    - cron: "17 3 * * 1"
-
-concurrency:
-  group: code-quality-security-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
+    outputs:
+      sonar_result:
+        description: SonarQube job result
+        value: ${{ jobs.results.outputs.sonar }}
+      gitleaks_result:
+        description: Gitleaks job result
+        value: ${{ jobs.results.outputs.gitleaks }}
+      semgrep_result:
+        description: Semgrep job result
+        value: ${{ jobs.results.outputs.semgrep }}
+      trivy_result:
+        description: Trivy job result
+        value: ${{ jobs.results.outputs.trivy }}
 
 permissions:
   contents: read
@@ -32,6 +33,35 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+
+      - name: Download Ruff report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sonar-ruff-report
+          path: .reports
+
+      - name: Download codespell report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sonar-codespell-report
+          path: .reports
+
+      - name: Download yamllint report
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sonar-yamllint-report
+          path: .reports
+
+      - name: Ensure report files exist
+        run: |
+          mkdir -p .reports
+          [ -f .reports/ruff.json ] || printf '[]\n' > .reports/ruff.json
+          for report in codespell-sonar.json yamllint-sonar.json; do
+            [ -f ".reports/$report" ] || printf '{"rules":[],"issues":[]}\n' > ".reports/$report"
+          done
 
       - name: Validate SonarQube configuration
         env:
@@ -53,10 +83,11 @@ jobs:
         run: |
           python3 - <<'PY'
           import base64
+          import os
           import pathlib
+          import urllib.error
           import urllib.parse
           import urllib.request
-          import os
 
           sonar_host = os.environ["SONAR_HOST_URL"].rstrip("/")
           sonar_token = os.environ["SONAR_TOKEN"]
@@ -105,13 +136,18 @@ jobs:
                   "continuing with the existing project."
               )
           else:
-              raise SystemExit(f"Unable to create SonarQube project {project_key}: HTTP {status} {body}")
+              raise SystemExit(
+                  f"Unable to create SonarQube project {project_key}: HTTP {status} {body}"
+              )
           PY
 
       - name: SonarQube scan
         uses: sonarsource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
         with:
-          args: -Dsonar.qualitygate.wait=true
+          args: >-
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.python.ruff.reportPaths=.reports/ruff.json
+            -Dsonar.externalIssuesReportPaths=.reports/codespell-sonar.json,.reports/yamllint-sonar.json
 
   secrets-scan:
     name: Gitleaks Secrets
@@ -167,238 +203,28 @@ jobs:
           path: trivy-results.txt
           retention-days: 7
 
-  report:
-    name: Report
+  results:
+    name: Security Results
     runs-on: ubuntu-latest
     needs: [sonar, secrets-scan, sast, deps-scan]
     if: always()
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: write
+    outputs:
+      sonar: ${{ steps.results.outputs.sonar }}
+      gitleaks: ${{ steps.results.outputs.gitleaks }}
+      semgrep: ${{ steps.results.outputs.semgrep }}
+      trivy: ${{ steps.results.outputs.trivy }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Build report
+      - name: Export results
+        id: results
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
           SONAR_RESULT: ${{ needs.sonar.result }}
           GITLEAKS_RESULT: ${{ needs.secrets-scan.result }}
           SEMGREP_RESULT: ${{ needs.sast.result }}
           TRIVY_RESULT: ${{ needs.deps-scan.result }}
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
-          GH_SHA: ${{ github.sha }}
-          GH_SERVER_URL: ${{ github.server_url }}
-          GH_RUN_ID: ${{ github.run_id }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
-          import pathlib
-          import urllib.parse
-          import urllib.request
-
-          checks = {
-              "SonarQube Quality Gate": os.environ.get("SONAR_RESULT", "unknown"),
-              "Gitleaks secrets": os.environ.get("GITLEAKS_RESULT", "unknown"),
-              "Semgrep SAST": os.environ.get("SEMGREP_RESULT", "unknown"),
-              "Trivy dependencies/CVEs": os.environ.get("TRIVY_RESULT", "unknown"),
-          }
-
-          repo = os.environ.get("GH_REPOSITORY", "")
-          ref = os.environ.get("GH_REF_NAME", "")
-          sha = os.environ.get("GH_SHA", "")[:7]
-          pr_num = os.environ.get("PR_NUMBER", "").strip()
-          pr_base = os.environ.get("PR_BASE_REF", "").strip()
-          default_branch = os.environ.get("DEFAULT_BRANCH", "").strip()
-          sonar_result = os.environ.get("SONAR_RESULT", "unknown")
-          run_url = (
-              f"{os.environ.get('GH_SERVER_URL', 'https://github.com')}"
-              f"/{repo}/actions/runs/{os.environ.get('GH_RUN_ID', '')}"
-          )
-          sonar_host = os.environ.get("SONAR_HOST_URL", "").strip().rstrip("/")
-          sonar_token = os.environ.get("SONAR_TOKEN", "").strip()
-          sonar_configured = bool(sonar_host and sonar_token)
-          sonar_pr_analysis = bool(
-              pr_num and pr_base == default_branch and sonar_result != "skipped"
-          )
-
-          project_key = ""
-          props = pathlib.Path("sonar-project.properties")
-          if props.exists():
-              for line in props.read_text().splitlines():
-                  line = line.strip()
-                  if line.startswith("sonar.projectKey="):
-                      project_key = line.split("=", 1)[1].strip()
-                      break
-          if not project_key:
-              project_key = repo.replace("/", "_")
-
-          def sonar_get(path, params):
-              if not sonar_host or not sonar_token:
-                  return None
-              query = urllib.parse.urlencode(params)
-              req = urllib.request.Request(f"{sonar_host}{path}?{query}")
-              token = base64.b64encode((sonar_token + ":").encode()).decode()
-              req.add_header("Authorization", f"Basic {token}")
-              try:
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      return json.loads(resp.read().decode())
-              except Exception as exc:
-                  return {"error": str(exc)}
-
-          quality_gate = None
-          issues = []
-          issue_lookup_error = False
-          if project_key and sonar_result != "skipped":
-              analysis_selector = {"projectKey": project_key}
-              if sonar_pr_analysis:
-                  analysis_selector["pullRequest"] = pr_num
-              quality_gate = sonar_get(
-                  "/api/qualitygates/project_status",
-                  analysis_selector,
-              )
-              issue_selector = {
-                  "componentKeys": project_key,
-                  "resolved": "false",
-                  "types": "VULNERABILITY,SECURITY_HOTSPOT",
-                  "severities": "BLOCKER,CRITICAL,HIGH,MAJOR",
-                  "ps": "10",
-              }
-              if sonar_pr_analysis:
-                  issue_selector["pullRequest"] = pr_num
-              issue_data = sonar_get(
-                  "/api/issues/search",
-                  issue_selector,
-              )
-              if isinstance(issue_data, dict) and "error" not in issue_data:
-                  issues = issue_data.get("issues", [])[:10]
-              elif isinstance(issue_data, dict):
-                  issue_lookup_error = True
-
-          qg_status = "SKIPPED" if sonar_result == "skipped" else "unknown"
-          if isinstance(quality_gate, dict) and "error" not in quality_gate:
-              qg_status = quality_gate.get("projectStatus", {}).get("status", "unknown")
-
-          if sonar_pr_analysis:
-              analysis_scope = f"pull request #{pr_num} -> {pr_base}"
-          elif sonar_result == "skipped" and pr_num:
-              analysis_scope = f"skipped: PR target {pr_base or 'unknown'} is not {default_branch}"
-          elif sonar_result == "skipped":
-              analysis_scope = "skipped: ref is not the default branch"
-          else:
-              analysis_scope = f"default branch {default_branch}"
-
-          icons = {"success": "PASS", "failure": "FAIL", "cancelled": "CANCELLED", "skipped": "SKIPPED"}
-          rows = [f"| {name} | {icons.get(result, result.upper())} |" for name, result in checks.items()]
-
-          sonar_url = sonar_host
-          if sonar_host and project_key:
-              dashboard_params = {"id": project_key}
-              if sonar_pr_analysis:
-                  dashboard_params["pullRequest"] = pr_num
-              sonar_url = f"{sonar_host}/dashboard?{urllib.parse.urlencode(dashboard_params)}"
-          issue_lines = []
-          for issue in issues:
-              component = issue.get("component", "")
-              path = component.split(":", 1)[1] if ":" in component else component
-              line = issue.get("line", "")
-              sev = issue.get("severity", issue.get("impactSeverity", ""))
-              msg = issue.get("message", "").replace("\n", " ")
-              issue_lines.append(f"- {sev} {path}:{line} - {msg}")
-
-          if issue_lookup_error and sonar_pr_analysis:
-              issue_summary = ["Open the SonarQube PR dashboard to review issue details."]
-          elif issue_lookup_error:
-              issue_summary = ["SonarQube issue details could not be retrieved by the report job."]
-          else:
-              issue_summary = issue_lines or ["No open SonarQube vulnerabilities/security hotspots returned by the API."]
-
-          markdown = [
-              "## Code Quality & Security Scan",
-              "",
-              "| Check | Result |",
-              "|---|---|",
-              *rows,
-              "",
-              f"SonarQube project: `{project_key or 'not configured'}`",
-              f"SonarQube analysis: `{analysis_scope}`",
-              f"SonarQube quality gate: `{qg_status}`",
-              f"SonarQube dashboard: {sonar_url or 'not configured'}",
-              f"SonarQube secrets configured: `{'yes' if sonar_configured else 'no'}`",
-              "",
-              "### Top Open SonarQube Security Issues",
-              *issue_summary,
-              "",
-              f"[View GitHub Actions run]({run_url})",
-          ]
-
-          all_passed = all(v in ("success", "skipped") for v in checks.values())
-          chat_lines = [
-              "CODE QUALITY & SECURITY SCAN PASSED" if all_passed else "CODE QUALITY & SECURITY SCAN - ACTION REQUIRED",
-              f"Repository : {repo}",
-              f"Branch     : {ref} | Commit: {sha}",
-              f"PR         : #{pr_num}" if pr_num else "Trigger    : push",
-              "",
-              *(f"{icons.get(v, v.upper())} - {k}" for k, v in checks.items()),
-              "",
-              f"SonarQube analysis: {analysis_scope}",
-              f"SonarQube quality gate: {qg_status}",
-              f"SonarQube dashboard: {sonar_url or 'not configured'}",
-              f"SonarQube secrets configured: {'yes' if sonar_configured else 'no'}",
-          ]
-          if issue_lines:
-              chat_lines.extend(["", "Top SonarQube security issues:", *issue_lines[:5]])
-          chat_lines.extend(["", f"Details: {run_url}"])
-
-          pathlib.Path("/tmp/scan-comment.md").write_text("\n".join(markdown))
-          pathlib.Path("/tmp/scan-chat.txt").write_text("\n".join(chat_lines))
-          PY
-
-      - name: Post PR comment
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          github-token: ${{ github.token }}
-          script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('/tmp/scan-comment.md', 'utf8');
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body,
-            });
-
-      - name: Notify Google Chat
-        env:
-          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import pathlib
-          import sys
-          import urllib.request
-
-          webhook = os.environ.get("GOOGLE_CHAT_WEBHOOK", "").strip()
-          if not webhook:
-              print("GOOGLE_CHAT_WEBHOOK secret not set - skipping notification.")
-              sys.exit(0)
-
-          text = pathlib.Path("/tmp/scan-chat.txt").read_text()
-          req = urllib.request.Request(
-              webhook,
-              data=json.dumps({"text": text}).encode(),
-              headers={"Content-Type": "application/json"},
-              method="POST",
-          )
-          with urllib.request.urlopen(req, timeout=20) as response:
-              print(f"Notification sent to Google Chat. HTTP {response.status}")
-          PY
+          {
+            printf 'sonar=%s\n' "$SONAR_RESULT"
+            printf 'gitleaks=%s\n' "$GITLEAKS_RESULT"
+            printf 'semgrep=%s\n' "$SEMGREP_RESULT"
+            printf 'trivy=%s\n' "$TRIVY_RESULT"
+          } >> "$GITHUB_OUTPUT"
