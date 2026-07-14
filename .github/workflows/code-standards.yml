@@ -1,0 +1,639 @@
+name: CI Quality Gate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - "**"
+  schedule:
+    - cron: "17 3 * * 1"
+
+concurrency:
+  group: ci-quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    name: Determine Changed Files
+    runs-on: ubuntu-latest
+    outputs:
+      python_files: ${{ steps.files.outputs.python_files }}
+      python_count: ${{ steps.files.outputs.python_count }}
+      text_files: ${{ steps.files.outputs.text_files }}
+      text_count: ${{ steps.files.outputs.text_count }}
+      workflow_files: ${{ steps.files.outputs.workflow_files }}
+      yaml_files: ${{ steps.files.outputs.yaml_files }}
+      yaml_count: ${{ steps.files.outputs.yaml_count }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Build file lists
+        id: files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          event = os.environ.get("EVENT_NAME", "")
+          base = os.environ.get("BASE_SHA", "")
+          before = os.environ.get("BEFORE_SHA", "")
+          zero = "0" * 40
+
+          if event == "pull_request" and base:
+              command = ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", f"{base}...HEAD"]
+          elif event == "push" and before and before != zero:
+              command = ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", f"{before}...HEAD"]
+          else:
+              command = ["git", "ls-files", "-z"]
+
+          raw = subprocess.check_output(command)
+          paths = [item.decode("utf-8", "surrogateescape") for item in raw.split(b"\0") if item]
+          excluded = (
+              ".git/", ".venv/", "venv/", "node_modules/", "dist/", "build/",
+              "vendor/", "third_party/", "cvat/", "__pycache__/",
+          )
+          paths = [
+              path for path in paths
+              if pathlib.Path(path).is_file() and not path.startswith(excluded)
+          ]
+
+          python_files = sorted(path for path in paths if pathlib.Path(path).suffix in {".py", ".pyi"})
+          text_extensions = {
+              ".css", ".html", ".ini", ".js", ".json", ".jsx", ".md", ".py", ".pyi",
+              ".rst", ".sh", ".toml", ".ts", ".tsx", ".txt", ".yaml", ".yml",
+          }
+          text_files = sorted(path for path in paths if pathlib.Path(path).suffix.lower() in text_extensions)
+          yaml_files = sorted(path for path in paths if pathlib.Path(path).suffix.lower() in {".yaml", ".yml"})
+          workflow_files = sorted(
+              path for path in subprocess.check_output(
+                  ["git", "ls-files", "-z", ".github/workflows/*.yml", ".github/workflows/*.yaml"]
+              ).decode("utf-8", "surrogateescape").split("\0") if path
+          )
+
+          outputs = {
+              "python_files": python_files,
+              "python_count": len(python_files),
+              "text_files": text_files,
+              "text_count": len(text_files),
+              "workflow_files": workflow_files,
+              "yaml_files": yaml_files,
+              "yaml_count": len(yaml_files),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              for key, value in outputs.items():
+                  encoded = json.dumps(value, separators=(",", ":")) if isinstance(value, list) else value
+                  handle.write(f"{key}={encoded}\n")
+          PY
+
+  python-lint:
+    name: Python Lint (Ruff)
+    runs-on: ubuntu-latest
+    needs: scope
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run Ruff
+        env:
+          FILES_JSON: ${{ needs.scope.outputs.python_files }}
+          FILE_COUNT: ${{ needs.scope.outputs.python_count }}
+        run: |
+          mkdir -p .reports
+          if [ "$FILE_COUNT" = "0" ]; then
+            printf '[]\n' > .reports/ruff.json
+            echo "No changed Python files."
+            exit 0
+          fi
+          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES_JSON"])))')
+          status=0
+          ruff check --extend-select I,B --exit-zero --output-format json \
+            --output-file .reports/ruff.json "${files[@]}" || status=$?
+          [ -s .reports/ruff.json ] || printf '[]\n' > .reports/ruff.json
+          RUFF_STATUS="$status" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          issues = json.loads(pathlib.Path(".reports/ruff.json").read_text())
+          for issue in issues:
+              location = issue.get("location", {})
+              message = issue.get("message", "Ruff issue").replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(
+                  f"::error file={issue.get('filename', '')},line={location.get('row', 1)},"
+                  f"col={location.get('column', 1)},title=Ruff {issue.get('code', '')}::{message}"
+              )
+          if int(os.environ["RUFF_STATUS"]) != 0:
+              raise SystemExit(int(os.environ["RUFF_STATUS"]))
+          if issues:
+              raise SystemExit(f"Ruff found {len(issues)} issue(s).")
+          PY
+
+      - name: Upload Ruff report for SonarQube
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sonar-ruff-report
+          path: .reports/ruff.json
+          if-no-files-found: error
+          retention-days: 7
+
+  python-format:
+    name: Python Format (Ruff)
+    runs-on: ubuntu-latest
+    needs: scope
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Check Ruff formatting
+        env:
+          FILES_JSON: ${{ needs.scope.outputs.python_files }}
+          FILE_COUNT: ${{ needs.scope.outputs.python_count }}
+        run: |
+          if [ "$FILE_COUNT" = "0" ]; then
+            echo "No changed Python files."
+            exit 0
+          fi
+          python3 -m pip install --disable-pip-version-check --quiet ruff==0.15.21
+          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES_JSON"])))')
+          ruff format --check --diff "${files[@]}"
+
+  spelling:
+    name: Spelling (codespell)
+    runs-on: ubuntu-latest
+    needs: scope
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run codespell
+        env:
+          FILES_JSON: ${{ needs.scope.outputs.text_files }}
+          FILE_COUNT: ${{ needs.scope.outputs.text_count }}
+        run: |
+          mkdir -p .reports
+          : > .reports/codespell.txt
+          status=0
+          if [ "$FILE_COUNT" != "0" ]; then
+            python3 -m pip install --disable-pip-version-check --quiet codespell==2.4.2
+            mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES_JSON"])))')
+            codespell --check-filenames "${files[@]}" > .reports/codespell.txt 2>&1 || status=$?
+            cat .reports/codespell.txt
+          else
+            echo "No changed text files."
+          fi
+          CODESPELL_STATUS="$status" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          raw = pathlib.Path(".reports/codespell.txt").read_text()
+          issues = []
+          pattern = re.compile(r"^(.*?):(\d+):\s*(.+)$")
+          for line in raw.splitlines():
+              match = pattern.match(line)
+              if not match:
+                  continue
+              path, line_number, message = match.groups()
+              if not pathlib.Path(path).is_file():
+                  continue
+              issues.append({
+                  "ruleId": "spelling",
+                  "effortMinutes": 2,
+                  "primaryLocation": {
+                      "message": message,
+                      "filePath": path,
+                      "textRange": {"startLine": int(line_number)},
+                  },
+              })
+          report = {
+              "rules": [{
+                  "id": "spelling",
+                  "name": "Spelling mistake",
+                  "description": "Possible spelling mistake reported by codespell.",
+                  "engineId": "codespell",
+                  "cleanCodeAttribute": "CONVENTIONAL",
+                  "type": "CODE_SMELL",
+                  "severity": "MINOR",
+                  "impacts": [{"softwareQuality": "MAINTAINABILITY", "severity": "LOW"}],
+              }],
+              "issues": issues,
+          }
+          pathlib.Path(".reports/codespell-sonar.json").write_text(json.dumps(report))
+          status = int(os.environ["CODESPELL_STATUS"])
+          if status:
+              raise SystemExit(status)
+          PY
+
+      - name: Upload codespell report for SonarQube
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sonar-codespell-report
+          path: .reports/codespell-sonar.json
+          if-no-files-found: error
+          retention-days: 7
+
+  actions-lint:
+    name: GitHub Actions (actionlint)
+    runs-on: ubuntu-latest
+    needs: scope
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Run actionlint
+        env:
+          FILES_JSON: ${{ needs.scope.outputs.workflow_files }}
+        run: |
+          mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES_JSON"])))')
+          if [ "${#files[@]}" = "0" ]; then
+            echo "No GitHub Actions workflows."
+            exit 0
+          fi
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color "${files[@]}"
+
+  yaml-lint:
+    name: YAML (yamllint)
+    runs-on: ubuntu-latest
+    needs: scope
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Run yamllint
+        env:
+          FILES_JSON: ${{ needs.scope.outputs.yaml_files }}
+          FILE_COUNT: ${{ needs.scope.outputs.yaml_count }}
+        run: |
+          mkdir -p .reports
+          : > .reports/yamllint.txt
+          status=0
+          if [ "$FILE_COUNT" != "0" ]; then
+            python3 -m pip install --disable-pip-version-check --quiet yamllint==1.38.0
+            mapfile -t files < <(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["FILES_JSON"])))')
+            yamllint -f parsable -d '{extends: default, rules: {comments: disable, document-start: disable, line-length: disable, truthy: {allowed-values: ["true", "false", "on"]}}}' \
+              "${files[@]}" > .reports/yamllint.txt 2>&1 || status=$?
+            cat .reports/yamllint.txt
+          else
+            echo "No changed YAML files."
+          fi
+          YAMLLINT_STATUS="$status" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          raw = pathlib.Path(".reports/yamllint.txt").read_text()
+          issues = []
+          pattern = re.compile(r"^(.*?):(\d+):(\d+):\s*\[(warning|error)\]\s*(.+)$")
+          for line in raw.splitlines():
+              match = pattern.match(line)
+              if not match:
+                  continue
+              path, line_number, column, level, message = match.groups()
+              if not pathlib.Path(path).is_file():
+                  continue
+              issues.append({
+                  "ruleId": "yaml-style",
+                  "effortMinutes": 3,
+                  "primaryLocation": {
+                      "message": message,
+                      "filePath": path,
+                      "textRange": {
+                          "startLine": int(line_number),
+                          "startColumn": max(0, int(column) - 1),
+                      },
+                  },
+              })
+          report = {
+              "rules": [{
+                  "id": "yaml-style",
+                  "name": "YAML lint issue",
+                  "description": "YAML correctness or consistency issue reported by yamllint.",
+                  "engineId": "yamllint",
+                  "cleanCodeAttribute": "FORMATTED",
+                  "type": "CODE_SMELL",
+                  "severity": "MINOR",
+                  "impacts": [{"softwareQuality": "MAINTAINABILITY", "severity": "LOW"}],
+              }],
+              "issues": issues,
+          }
+          pathlib.Path(".reports/yamllint-sonar.json").write_text(json.dumps(report))
+          status = int(os.environ["YAMLLINT_STATUS"])
+          if status:
+              raise SystemExit(status)
+          PY
+
+      - name: Upload yamllint report for SonarQube
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sonar-yamllint-report
+          path: .reports/yamllint-sonar.json
+          if-no-files-found: error
+          retention-days: 7
+
+  security:
+    name: Security
+    needs: [python-lint, python-format, spelling, actions-lint, yaml-lint]
+    if: always()
+    uses: ./.github/workflows/code-quality-security.yml
+    secrets: inherit
+
+  report:
+    name: Consolidated Report
+    runs-on: ubuntu-latest
+    needs: [python-lint, python-format, spelling, actions-lint, yaml-lint, security]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build consolidated report
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          RUFF_LINT_RESULT: ${{ needs.python-lint.result }}
+          RUFF_FORMAT_RESULT: ${{ needs.python-format.result }}
+          CODESPELL_RESULT: ${{ needs.spelling.result }}
+          ACTIONLINT_RESULT: ${{ needs.actions-lint.result }}
+          YAMLLINT_RESULT: ${{ needs.yaml-lint.result }}
+          SONAR_RESULT: ${{ needs.security.outputs.sonar_result }}
+          GITLEAKS_RESULT: ${{ needs.security.outputs.gitleaks_result }}
+          SEMGREP_RESULT: ${{ needs.security.outputs.semgrep_result }}
+          TRIVY_RESULT: ${{ needs.security.outputs.trivy_result }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+          GH_SHA: ${{ github.sha }}
+          GH_SERVER_URL: ${{ github.server_url }}
+          GH_RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import urllib.parse
+          import urllib.request
+
+          def result(name):
+              return os.environ.get(name, "").strip() or "unknown"
+
+          checks = {
+              "Python lint (Ruff)": result("RUFF_LINT_RESULT"),
+              "Python format (Ruff)": result("RUFF_FORMAT_RESULT"),
+              "Spelling (codespell)": result("CODESPELL_RESULT"),
+              "GitHub Actions (actionlint)": result("ACTIONLINT_RESULT"),
+              "YAML (yamllint)": result("YAMLLINT_RESULT"),
+              "SonarQube Quality Gate": result("SONAR_RESULT"),
+              "Gitleaks secrets": result("GITLEAKS_RESULT"),
+              "Semgrep SAST": result("SEMGREP_RESULT"),
+              "Trivy dependencies/CVEs": result("TRIVY_RESULT"),
+          }
+
+          repo = os.environ.get("GH_REPOSITORY", "")
+          ref = os.environ.get("GH_REF_NAME", "")
+          sha = os.environ.get("GH_SHA", "")[:7]
+          pr_num = os.environ.get("PR_NUMBER", "").strip()
+          pr_base = os.environ.get("PR_BASE_REF", "").strip()
+          default_branch = os.environ.get("DEFAULT_BRANCH", "").strip()
+          sonar_result = result("SONAR_RESULT")
+          run_url = (
+              f"{os.environ.get('GH_SERVER_URL', 'https://github.com')}"
+              f"/{repo}/actions/runs/{os.environ.get('GH_RUN_ID', '')}"
+          )
+          sonar_host = os.environ.get("SONAR_HOST_URL", "").strip().rstrip("/")
+          sonar_token = os.environ.get("SONAR_TOKEN", "").strip()
+          sonar_configured = bool(sonar_host and sonar_token)
+          sonar_pr_analysis = bool(
+              pr_num and pr_base == default_branch and sonar_result != "skipped"
+          )
+
+          project_key = ""
+          props = pathlib.Path("sonar-project.properties")
+          if props.exists():
+              for line in props.read_text().splitlines():
+                  line = line.strip()
+                  if line.startswith("sonar.projectKey="):
+                      project_key = line.split("=", 1)[1].strip()
+                      break
+          if not project_key:
+              project_key = repo.replace("/", "_")
+
+          def sonar_get(path, params):
+              if not sonar_host or not sonar_token:
+                  return None
+              query = urllib.parse.urlencode(params)
+              req = urllib.request.Request(f"{sonar_host}{path}?{query}")
+              token = base64.b64encode((sonar_token + ":").encode()).decode()
+              req.add_header("Authorization", f"Basic {token}")
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as response:
+                      return json.loads(response.read().decode())
+              except Exception as exc:
+                  return {"error": str(exc)}
+
+          quality_gate = None
+          issues = []
+          issue_lookup_error = False
+          if project_key and sonar_result != "skipped":
+              selector = {"projectKey": project_key}
+              if sonar_pr_analysis:
+                  selector["pullRequest"] = pr_num
+              quality_gate = sonar_get("/api/qualitygates/project_status", selector)
+              issue_selector = {
+                  "componentKeys": project_key,
+                  "resolved": "false",
+                  "types": "VULNERABILITY,SECURITY_HOTSPOT",
+                  "severities": "BLOCKER,CRITICAL,HIGH,MAJOR",
+                  "ps": "10",
+              }
+              if sonar_pr_analysis:
+                  issue_selector["pullRequest"] = pr_num
+              issue_data = sonar_get("/api/issues/search", issue_selector)
+              if isinstance(issue_data, dict) and "error" not in issue_data:
+                  issues = issue_data.get("issues", [])[:10]
+              elif isinstance(issue_data, dict):
+                  issue_lookup_error = True
+
+          qg_status = {
+              "success": "OK",
+              "failure": "ERROR",
+              "cancelled": "CANCELLED",
+              "skipped": "SKIPPED",
+          }.get(sonar_result, "unknown")
+          if isinstance(quality_gate, dict) and "error" not in quality_gate:
+              qg_status = quality_gate.get("projectStatus", {}).get("status", "unknown")
+
+          if sonar_pr_analysis:
+              analysis_scope = f"pull request #{pr_num} -> {pr_base}"
+          elif sonar_result == "skipped" and pr_num:
+              analysis_scope = f"skipped: PR target {pr_base or 'unknown'} is not {default_branch}"
+          elif sonar_result == "skipped":
+              analysis_scope = "skipped: ref is not the default branch"
+          else:
+              analysis_scope = f"default branch {default_branch}"
+
+          icons = {
+              "success": "PASS", "failure": "FAIL", "cancelled": "CANCELLED",
+              "skipped": "SKIPPED", "unknown": "UNKNOWN",
+          }
+          rows = [f"| {name} | {icons.get(value, value.upper())} |" for name, value in checks.items()]
+
+          issue_lines = []
+          for issue in issues:
+              component = issue.get("component", "")
+              path = component.split(":", 1)[1] if ":" in component else component
+              line = issue.get("line", "")
+              severity = issue.get("severity", issue.get("impactSeverity", ""))
+              message = issue.get("message", "").replace("\n", " ")
+              issue_lines.append(f"- {severity} {path}:{line} - {message}")
+
+          if issue_lookup_error and sonar_pr_analysis:
+              issue_summary = ["Open the SonarQube PR dashboard to review issue details."]
+          elif issue_lookup_error:
+              issue_summary = ["SonarQube issue details could not be retrieved by the report job."]
+          else:
+              issue_summary = issue_lines or ["No open SonarQube vulnerabilities/security hotspots returned by the API."]
+
+          markdown = [
+              "<!-- toothlens-ci-quality-gate -->",
+              "## CI Quality Gate",
+              "",
+              "| Check | Result |",
+              "|---|---|",
+              *rows,
+              "",
+              "Ruff, codespell, and yamllint issue reports are imported into SonarQube.",
+              f"SonarQube project: `{project_key or 'not configured'}`",
+              f"SonarQube analysis: `{analysis_scope}`",
+              f"SonarQube quality gate: `{qg_status}`",
+              "SonarQube dashboard: access through the configured SonarQube service",
+              f"SonarQube secrets configured: `{'yes' if sonar_configured else 'no'}`",
+              "",
+              "### Top Open SonarQube Security Issues",
+              *issue_summary,
+              "",
+              f"[View GitHub Actions run]({run_url})",
+          ]
+
+          all_passed = all(value in ("success", "skipped") for value in checks.values())
+          chat_lines = [
+              "CI QUALITY GATE PASSED" if all_passed else "CI QUALITY GATE - ACTION REQUIRED",
+              f"Repository : {repo}",
+              f"Branch     : {ref} | Commit: {sha}",
+              f"PR         : #{pr_num}" if pr_num else "Trigger    : push",
+              "",
+              *(f"{icons.get(value, value.upper())} - {name}" for name, value in checks.items()),
+              "",
+              f"SonarQube analysis: {analysis_scope}",
+              f"SonarQube quality gate: {qg_status}",
+              "SonarQube dashboard: access details intentionally omitted",
+          ]
+          if issue_lines:
+              chat_lines.extend(["", "Top SonarQube security issues:", *issue_lines[:5]])
+          chat_lines.extend(["", f"Details: {run_url}"])
+
+          pathlib.Path("/tmp/scan-comment.md").write_text("\n".join(markdown))
+          pathlib.Path("/tmp/scan-chat.txt").write_text("\n".join(chat_lines))
+          PY
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/scan-comment.md', 'utf8');
+            const marker = '<!-- toothlens-ci-quality-gate -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const existing = comments.find(comment =>
+              comment.user?.login === 'github-actions[bot]' && comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body,
+              });
+            }
+
+      - name: Notify Google Chat
+        if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import urllib.request
+
+          webhook = os.environ.get("GOOGLE_CHAT_WEBHOOK", "").strip()
+          if not webhook:
+              print("GOOGLE_CHAT_WEBHOOK secret not set - skipping notification.")
+              sys.exit(0)
+
+          text = pathlib.Path("/tmp/scan-chat.txt").read_text()
+          request = urllib.request.Request(
+              webhook,
+              data=json.dumps({"text": text}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=20) as response:
+              print(f"Notification sent to Google Chat. HTTP {response.status}")
+          PY
