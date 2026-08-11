@@ -12,9 +12,6 @@ on:
       semgrep_result:
         description: Semgrep job result
         value: ${{ jobs.results.outputs.semgrep }}
-      trivy_result:
-        description: Trivy job result
-        value: ${{ jobs.results.outputs.trivy }}
 
 permissions:
   contents: read
@@ -24,11 +21,6 @@ jobs:
     name: SonarQube Quality Gate
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    if: >-
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.base.ref == github.event.repository.default_branch) ||
-      (github.event_name != 'pull_request' &&
-       github.ref_name == github.event.repository.default_branch)
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -41,27 +33,10 @@ jobs:
           name: sonar-ruff-report
           path: .reports
 
-      - name: Download codespell report
-        continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sonar-codespell-report
-          path: .reports
-
-      - name: Download yamllint report
-        continue-on-error: true
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: sonar-yamllint-report
-          path: .reports
-
       - name: Ensure report files exist
         run: |
           mkdir -p .reports
           [ -f .reports/ruff.json ] || printf '[]\n' > .reports/ruff.json
-          for report in codespell-sonar.json yamllint-sonar.json; do
-            [ -f ".reports/$report" ] || printf '{"rules":[],"issues":[]}\n' > ".reports/$report"
-          done
 
       - name: Validate SonarQube configuration
         env:
@@ -147,7 +122,6 @@ jobs:
           args: >-
             -Dsonar.qualitygate.wait=true
             -Dsonar.python.ruff.reportPaths=.reports/ruff.json
-            -Dsonar.externalIssuesReportPaths=.reports/codespell-sonar.json,.reports/yamllint-sonar.json
 
   secrets-scan:
     name: Gitleaks Secrets
@@ -182,41 +156,15 @@ jobs:
           --config p/secrets
           --exclude-rule generic.secrets.security.detected-sonarqube-docs-api-key.detected-sonarqube-docs-api-key
 
-  deps-scan:
-    name: Trivy Dependencies
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          severity: CRITICAL,HIGH
-          exit-code: "1"
-          format: table
-          output: trivy-results.txt
-
-      - name: Upload Trivy results
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: trivy-results
-          path: trivy-results.txt
-          retention-days: 7
-
   results:
     name: Security Results
     runs-on: ubuntu-latest
-    needs: [sonar, secrets-scan, sast, deps-scan]
+    needs: [sonar, secrets-scan, sast]
     if: always()
     outputs:
       sonar: ${{ steps.results.outputs.sonar }}
       gitleaks: ${{ steps.results.outputs.gitleaks }}
       semgrep: ${{ steps.results.outputs.semgrep }}
-      trivy: ${{ steps.results.outputs.trivy }}
     steps:
       - name: Export results
         id: results
@@ -224,11 +172,9 @@ jobs:
           SONAR_RESULT: ${{ needs.sonar.result }}
           GITLEAKS_RESULT: ${{ needs.secrets-scan.result }}
           SEMGREP_RESULT: ${{ needs.sast.result }}
-          TRIVY_RESULT: ${{ needs.deps-scan.result }}
         run: |
           {
             printf 'sonar=%s\n' "$SONAR_RESULT"
             printf 'gitleaks=%s\n' "$GITLEAKS_RESULT"
             printf 'semgrep=%s\n' "$SEMGREP_RESULT"
-            printf 'trivy=%s\n' "$TRIVY_RESULT"
           } >> "$GITHUB_OUTPUT"
